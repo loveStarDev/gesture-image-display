@@ -7,6 +7,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import os
+from collections import deque, Counter
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -29,6 +30,9 @@ GESTURE_LABELS = {
 }
 
 DISPLAY_DURATION = 90
+HOLD_FRAMES = 20
+SMOOTH_WINDOW = 15
+SMOOTH_THRESHOLD = 8
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 IMAGE_WINDOW = "Image"
 CAM_WINDOW   = "Gesture Cam"
@@ -62,11 +66,10 @@ def get_finger_states(landmarks, is_right):
     lm = landmarks
     fingers = []
 
-    # 엄지: 좌우 방향으로 판별
-    if is_right:
-        fingers.append(lm[4].x < lm[3].x)
-    else:
-        fingers.append(lm[4].x > lm[3].x)
+    # 엄지: x좌표 + 3D 거리 복합 판별
+    thumb_by_x = lm[4].x < lm[3].x if is_right else lm[4].x > lm[3].x
+    thumb_by_dist = is_finger_extended(lm, 4, 3, 2)
+    fingers.append(thumb_by_x or thumb_by_dist)
 
     # 검지~새끼: 3D 거리 기반
     for tip, pip, mcp in zip([8, 12, 16, 20], [6, 10, 14, 18], [5, 9, 13, 17]):
@@ -134,17 +137,17 @@ def detect_gesture(hands_data):
         if detect_claw(lm, fingers, palm):
             return "claw"
 
-        # 2. V / 브이: 검지+중지 펼침, 나머지 접힘 (손바닥/손등 무관)
-        if index and middle and not ring and not pinky and not thumb:
-            return "peace"
-
-        # 3. 엄지 치켜들기: 엄지만 펼침 (손바닥/손등 무관)
-        if thumb and not index and not middle and not ring and not pinky:
-            return "thumb_up"
-
-        # 4. ㅜ자 / 총: 엄지+검지 펼침, 나머지 접힘, 검지가 아래를 향함
+        # 2. ㅜ자 / 총: 엄지+검지 펼침, 중지/약지/새끼 접힘 (peace보다 먼저 체크)
         if detect_gun(lm, fingers, is_right):
             return "gun"
+
+        # 3. V / 브이: 검지+중지 펼침, 약지+새끼 접힘 (엄지 상태 무관)
+        if index and middle and not ring and not pinky:
+            return "peace"
+
+        # 4. 엄지 치켜들기: 엄지만 펼침 (손바닥/손등 무관)
+        if thumb and not index and not middle and not ring and not pinky:
+            return "thumb_up"
 
     return None
 
@@ -230,9 +233,9 @@ def main():
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
         num_hands=2,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_hand_detection_confidence=0.7,
+        min_hand_presence_confidence=0.7,
+        min_tracking_confidence=0.6,
     )
     landmarker = vision.HandLandmarker.create_from_options(options)
 
@@ -241,6 +244,8 @@ def main():
         print("[ERROR] Cannot open camera.")
         return
 
+    gesture_history = deque(maxlen=SMOOTH_WINDOW)
+    hold_counter = 0
     current_gesture = None
     display_counter = 0
     image_showing = False
@@ -268,14 +273,33 @@ def main():
 
         detected = detect_gesture(hands_data)
 
-        if detected:
-            if detected != current_gesture:
-                print(f"Detected: {detected}")
-            current_gesture = detected
+        # 히스토리에 추가 (None도 추가)
+        gesture_history.append(detected)
+
+        # 스무딩: 최빈값이 threshold 이상이면 확정
+        smoothed = None
+        if gesture_history:
+            counts = Counter(g for g in gesture_history if g is not None)
+            if counts:
+                top_gesture, top_count = counts.most_common(1)[0]
+                if top_count >= SMOOTH_THRESHOLD:
+                    smoothed = top_gesture
+
+        if smoothed:
+            if smoothed != current_gesture:
+                print(f"Detected: {smoothed}")
+            current_gesture = smoothed
             display_counter = DISPLAY_DURATION
+            hold_counter = HOLD_FRAMES
         else:
-            current_gesture = None
-            display_counter = 0
+            if hold_counter > 0:
+                hold_counter -= 1
+                display_counter = max(display_counter - 1, 1)
+            else:
+                if current_gesture is not None:
+                    print("Gesture lost")
+                current_gesture = None
+                display_counter = 0
 
         # 이미지 별도 창 표시
         if current_gesture and current_gesture in images:
